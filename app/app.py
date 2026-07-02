@@ -14,6 +14,7 @@ from utils import genre_overlap, get_user_profile_stats, get_user_taste_profile
 
 DATA_DIR = Path(__file__).parent.parent / "data" / "raw"
 MODEL_PATH = Path(__file__).parent.parent / "models" / "svd_model.pkl"
+EMBEDDINGS_PATH = Path(__file__).parent.parent / "data" / "overview_embeddings.npz"
 
 # Semi-transparent indigo badge: readable in both dark and light Streamlit themes
 # because it uses rgba() rather than a hard-coded hex colour.
@@ -46,10 +47,12 @@ def load_model() -> SVDRecommender:
 
 @st.cache_resource(show_spinner="Building hybrid recommender...")
 def load_hybrid(_svd: SVDRecommender, _ratings: pd.DataFrame, _movies: pd.DataFrame) -> HybridRecommender:
-    # Content model is cheap to fit (just genre encoding), so we build it at
-    # startup rather than pickling a second artifact. Leading underscores tell
-    # Streamlit not to hash these unhashable args.
-    content = ContentRecommender().fit(_movies)
+    # Content model is cheap to fit (genre encoding + loading pre-computed
+    # overview embeddings), so we build it at startup rather than pickling a
+    # second artifact. beta=0.5 (constructor default): equal weight to genre
+    # cosine and plot-embedding cosine; degrades to genre-only if the npz is
+    # absent. Leading underscores tell Streamlit not to hash unhashable args.
+    content = ContentRecommender().fit(_movies, embeddings_path=EMBEDDINGS_PATH)
     return HybridRecommender(_svd, content, _ratings)
 
 
@@ -153,12 +156,22 @@ def _render_picks_grid(
 
 # Preset personas → representative MovieLens user IDs. Data-driven picks: each
 # user's highly-rated history leans strongly toward the named taste. Swap freely.
+# Third field: apply the family content filter when this persona is active.
 PERSONAS = [
-    ("🎬 Action Fan", 493),
-    ("💕 Romance Lover", 358),
-    ("🧠 Indie Buff", 74),
-    ("👨‍👩‍👧 Family Night", 401),
+    ("🎬 Action Fan", 493, False),
+    ("💕 Romance Lover", 358, False),
+    ("🧠 Indie Buff", 74, False),
+    ("👨‍👩‍👧 Family Night", 401, True),
 ]
+
+# Family Night soft content filter. SVD has no concept of appropriateness — it
+# ranks purely by rating-pattern similarity, so user 401's neighbours' love of
+# American Beauty/Hannibal leaks into a "family" persona. When the Family Night
+# persona is active we keep SVD's ranking but restrict candidates to movies
+# tagged "Children". Children (not Animation) is the trustworthy tag: Animation
+# alone admits adult titles like Heavy Metal, Akira and Beavis and Butt-Head.
+FAMILY_TAG = "Children"
+FAMILY_POOL_DEPTH = 300  # how deep to rank before filtering down to n
 
 
 def _render_taste_profile(uid: int, ratings_df: pd.DataFrame, movies_df: pd.DataFrame) -> None:
@@ -240,13 +253,17 @@ collaborative half, they are **not** how SVD chose the movie.
         st.session_state.show_recs = False
     if "nv_show_recs" not in st.session_state:
         st.session_state.nv_show_recs = False
+    if "active_persona" not in st.session_state:
+        st.session_state.active_persona = None
 
     def _select_persona(pid: int) -> None:
         st.session_state.user_id = pid
+        st.session_state.active_persona = pid
         st.session_state.show_recs = True  # personas auto-trigger recommendations
 
     def _on_user_change() -> None:
         st.session_state.show_recs = False  # manual edit: show profile, wait to recommend
+        st.session_state.active_persona = None  # leaving the persona drops its filter
 
     def _on_picks_change() -> None:
         st.session_state.nv_show_recs = False  # picks edited: wait for re-submit
@@ -279,7 +296,7 @@ collaborative half, they are **not** how SVD chose the movie.
         if mode == "Existing User":
             st.markdown("**Try a persona**")
             pcols = st.columns(2)
-            for i, (label, pid) in enumerate(PERSONAS):
+            for i, (label, pid, _fam) in enumerate(PERSONAS):
                 pcols[i % 2].button(
                     label,
                     key=f"persona_{pid}",
@@ -377,7 +394,21 @@ collaborative half, they are **not** how SVD chose the movie.
         st.error(f"User ID {uid} isn't in the training data. Try {min_uid}–{max_uid}.")
         return
 
-    recs = hybrid.recommend(user_id=uid, n=n_recs, alpha=alpha)
+    # Family Night persona: rank as usual, but keep only family-tagged movies.
+    # A post-filter (rather than a lower alpha) preserves SVD's ranking quality
+    # within the family-safe set and guarantees every card fits the framing.
+    active = st.session_state.active_persona
+    family_mode = any(pid == active == uid and fam for _, pid, fam in PERSONAS)
+    if family_mode:
+        family_ids = set(
+            movies_df.loc[
+                movies_df["genres"].str.contains(FAMILY_TAG, na=False), "movieId"
+            ].astype(int)
+        )
+        deep = hybrid.recommend(user_id=uid, n=FAMILY_POOL_DEPTH, alpha=alpha)
+        recs = [(m, s) for m, s in deep if m in family_ids][:n_recs]
+    else:
+        recs = hybrid.recommend(user_id=uid, n=n_recs, alpha=alpha)
     if not recs:
         st.warning("No new recommendations found — this user may have already rated most movies.")
         return
@@ -408,6 +439,13 @@ collaborative half, they are **not** how SVD chose the movie.
         f"Blending rating history ({int(round(alpha * 100))}% collaborative) "
         f"with genre similarity ({int(round((1 - alpha) * 100))}% content)."
     )
+    if family_mode:
+        st.caption(
+            f"👨‍👩‍👧 **Family Night filter on:** picks are limited to movies tagged "
+            f"*{FAMILY_TAG}*. Collaborative filtering ranks by taste similarity alone "
+            f"and has no concept of content appropriateness, so this persona adds a "
+            f"soft genre-based filter on top. Edit the User ID to turn it off."
+        )
     _render_picks_grid(recs, movie_meta, liked_genres, show_posters, poster_map, hybrid=hybrid, uid=uid)
 
 

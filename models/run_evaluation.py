@@ -124,7 +124,11 @@ def main() -> None:
 
     print("Fitting models on the train split...")
     svd = SVDRecommender(n_components=N_COMPONENTS).fit(train_df)
-    content = ContentRecommender().fit(movies)  # item features only; no ratings
+    # Item features only (no ratings): genre multi-hot + overview embeddings
+    # (beta=0.5 combined scoring; silently genre-only if the npz is absent).
+    content = ContentRecommender().fit(
+        movies, embeddings_path=DATA_DIR.parent / "overview_embeddings.npz"
+    )
     hybrid = HybridRecommender(svd, content, train_df)
 
     # Ground truth: per user, the test-set movies they rated >= 4.0 (+ ratings
