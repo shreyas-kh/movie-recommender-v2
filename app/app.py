@@ -171,7 +171,6 @@ PERSONAS = [
 # tagged "Children". Children (not Animation) is the trustworthy tag: Animation
 # alone admits adult titles like Heavy Metal, Akira and Beavis and Butt-Head.
 FAMILY_TAG = "Children"
-FAMILY_POOL_DEPTH = 300  # how deep to rank before filtering down to n
 
 
 def _render_taste_profile(uid: int, ratings_df: pd.DataFrame, movies_df: pd.DataFrame) -> None:
@@ -201,14 +200,14 @@ def main():
     st.markdown(_CSS, unsafe_allow_html=True)
 
     st.title("🎬 Movie Recommender")
-    st.caption("Hybrid recommender · SVD collaborative filtering + content-based genre similarity · MovieLens (~100k ratings)")
+    st.caption("Hybrid recommender · SVD collaborative filtering + content-based similarity (genres + plot embeddings) · MovieLens (~100k ratings)")
 
     st.info(
         "👋 **New here?** This app blends two recommenders. As an **existing user** "
         "(610 real MovieLens users), pick a User ID or persona and dial the blend "
-        "between collaborative filtering and genre similarity. As a **new visitor**, "
-        "just pick a few movies you like and get instant content-based picks — no "
-        "history needed. Choose a mode in the sidebar to start."
+        "between collaborative filtering and content similarity (genres + plot). "
+        "As a **new visitor**, just pick a few movies you like and get instant "
+        "content-based picks — no history needed. Choose a mode in the sidebar to start."
     )
 
     with st.expander("How it works", expanded=False):
@@ -221,16 +220,34 @@ This app combines **two** recommendation approaches:
 rated what and how highly, with no knowledge of genres or plot. It predicts how a user would rate films
 they haven't seen, then surfaces the highest predictions.
 
-**2. Content-based filtering.** Each movie is encoded as a multi-hot vector of its genres. Recommendations
-come from **cosine similarity** between what you liked and everything else. Because it needs no rating
-history for the *user*, it works from a single liked movie — this is the **cold-start** fix that pure
-collaborative filtering can't handle (a brand-new visitor has no factors to look up).
+**2. Content-based filtering.** Each movie is described by **two feature signals, blended**: a multi-hot
+vector of its genres, and a **semantic embedding of its plot summary** (a sentence-transformer model applied
+to TMDB overview text, precomputed offline). Recommendations come from **cosine similarity** between what
+you liked and everything else, as a weighted combination of the two signals. They fail in complementary
+ways — genres know *tone* but can't rank within a category (hundreds of Animation/Children movies tie),
+while plot embeddings know *story* (they find sequels and franchise kin) but not tone ("toys come to life"
+matches both *Toy Story 2* and the slasher *Child's Play*; the genre term vetoes the latter). Because
+content filtering needs no rating history for the *user*, it works from a single liked movie — this is the
+**cold-start** fix that pure collaborative filtering can't handle (a brand-new visitor has no factors to
+look up).
 
 **The hybrid** normalizes both score ranges and blends them: `alpha × collaborative + (1 − alpha) × content`.
 Slide toward collaborative for taste patterns, toward content for genre-driven similarity.
 
 The **"Matches your interest in: …"** labels are a post-hoc transparency aid comparing genres — for the
 collaborative half, they are **not** how SVD chose the movie.
+
+---
+
+**How good is it, honestly?** On aggregate hit-rate metrics under a rigorous temporal evaluation,
+the personalized models are statistically indistinguishable from simply recommending the most-rated
+movies — popular films dominate what users happen to rate next, and aggregate metrics reward that
+regardless of personalization. A stratified analysis of **long-tail** recommendations (excluding the
+100 most-rated movies) tells the other half of the story: SVD provides statistically significant
+personalization value there (95% CI excludes zero on all three ranking metrics), with about 20% of
+evaluated users receiving at least one long-tail recommendation they went on to rate highly. A
+popularity-based system cannot produce those recommendations by construction — that discovery value
+is what personalization adds, even where aggregate metrics can't see it.
             """
         )
 
@@ -326,7 +343,7 @@ collaborative half, they are **not** how SVD chose the movie.
                 max_value=1.0,
                 value=1.0,
                 step=0.05,
-                help="1.0 = pure collaborative (SVD) · 0.0 = pure content (genres)",
+                help="1.0 = pure collaborative (SVD) · 0.0 = pure content (genres + plot similarity)",
             )
             st.caption(f"{int(round(alpha * 100))}% collaborative · {int(round((1 - alpha) * 100))}% content")
             st.caption(
@@ -405,12 +422,25 @@ collaborative half, they are **not** how SVD chose the movie.
                 movies_df["genres"].str.contains(FAMILY_TAG, na=False), "movieId"
             ].astype(int)
         )
-        deep = hybrid.recommend(user_id=uid, n=FAMILY_POOL_DEPTH, alpha=alpha)
-        recs = [(m, s) for m, s in deep if m in family_ids][:n_recs]
+        # Rank the FULL candidate set (every unseen movie), then filter. A
+        # fixed pool depth can silently starve the filter: at alpha=1.0 the
+        # top 300 held only 21 family-tagged movies against a 20-max slider,
+        # one retrain away from coming up short. Ranking everything costs the
+        # same (scores are computed for all movies either way) and guarantees
+        # every unseen family movie is reachable.
+        ranked = hybrid.recommend(user_id=uid, n=len(svd.movie_ids), alpha=alpha)
+        recs = [(m, s) for m, s in ranked if m in family_ids][:n_recs]
     else:
         recs = hybrid.recommend(user_id=uid, n=n_recs, alpha=alpha)
     if not recs:
-        st.warning("No new recommendations found — this user may have already rated most movies.")
+        if family_mode:
+            st.warning(
+                f"No family recommendations available — this user has already "
+                f"rated every movie tagged *{FAMILY_TAG}*. Edit the User ID to "
+                f"leave the Family Night persona."
+            )
+        else:
+            st.warning("No new recommendations found — this user may have already rated most movies.")
         return
 
     # --- "Because you rated these highly" — the user's own evidence ----------
@@ -435,10 +465,21 @@ collaborative half, they are **not** how SVD chose the movie.
 
     # Connecting narrative: ties the taste profile above to the picks below.
     st.subheader(f"🍿 Top {len(recs)} picks for User {uid}")
-    st.caption(
-        f"Blending rating history ({int(round(alpha * 100))}% collaborative) "
-        f"with genre similarity ({int(round((1 - alpha) * 100))}% content)."
-    )
+    if hybrid.has_liked_history(uid):
+        st.caption(
+            f"Blending rating history ({int(round(alpha * 100))}% collaborative) "
+            f"with content similarity ({int(round((1 - alpha) * 100))}% content)."
+        )
+    else:
+        # No rating >= 3.5 means no taste profile for the content half: the
+        # blend is pure SVD at any alpha. Say so rather than claiming
+        # percentages that aren't happening.
+        st.caption(
+            "⚠️ Content-based blending isn't contributing for this user — they "
+            "have no ratings of 3.5 or higher to build a taste profile from, so "
+            "these picks come from collaborative filtering alone, regardless of "
+            "the blend slider."
+        )
     if family_mode:
         st.caption(
             f"👨‍👩‍👧 **Family Night filter on:** picks are limited to movies tagged "
@@ -446,6 +487,11 @@ collaborative half, they are **not** how SVD chose the movie.
             f"and has no concept of content appropriateness, so this persona adds a "
             f"soft genre-based filter on top. Edit the User ID to turn it off."
         )
+        if len(recs) < n_recs:
+            st.info(
+                f"Only {len(recs)} unseen *{FAMILY_TAG}*-tagged movies remain "
+                f"for this user (you asked for {n_recs}) — showing all of them."
+            )
     _render_picks_grid(recs, movie_meta, liked_genres, show_posters, poster_map, hybrid=hybrid, uid=uid)
 
 

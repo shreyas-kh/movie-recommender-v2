@@ -1,5 +1,6 @@
 """
-Offline ranking evaluation: SVD-only vs Content-only vs Hybrid.
+Offline ranking evaluation: Popularity baseline vs SVD-only vs Content-only
+vs Hybrid.
 
 Protocol
 --------
@@ -15,6 +16,16 @@ Protocol
 * Sampled users need >= MIN_TEST_RELEVANT relevant test movies (so recall and
   NDCG aren't decided by a single item) and at least one liked train movie
   (so the content model has an input).
+* The popularity baseline is the scientific control: recommend the K most-rated
+  movies (by TRAIN rating count) the user hasn't rated in train. Entirely
+  non-personalised — any model worth deploying should beat it, and every table
+  includes it so the personalised numbers have an anchor.
+* The long-tail stratified table re-scores each model's SAME top-10 lists
+  against only the relevant test items OUTSIDE the HEAD_SIZE most-rated movies.
+  Aggregate hit metrics are popularity-biased (held-out loved movies are mostly
+  famous ones), so a most-popular list scores well without personalising; in
+  the long-tail stratum that shortcut is unavailable by construction, making
+  any hits there unambiguous personalisation signal.
 
 Run from the project root:
     python models/run_evaluation.py                  # temporal split (default)
@@ -24,7 +35,7 @@ import argparse
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -49,6 +60,9 @@ SPARSE_THRESHOLD = 20   # "sparse-history" = fewer than this many TRAIN ratings
 # users rarely have 5+ relevant test ratings (that filter is itself biased
 # against low-activity users), so >= 2 keeps the sample meaningful in size.
 SPARSE_MIN_TEST_RELEVANT = 2
+# "Head" = this many most-rated train movies. Relevant test items outside the
+# head form the long-tail stratum for the stratified table.
+HEAD_SIZE = 100
 
 
 def _liked_from_train(train_df: pd.DataFrame, user_id: int) -> Tuple[List[int], List[float]]:
@@ -63,6 +77,54 @@ def _liked_from_train(train_df: pd.DataFrame, user_id: int) -> Tuple[List[int], 
                 [float(r) for r in liked["rating"].tolist()],
             )
     return [], []
+
+
+def _popularity_ranking(train_df: pd.DataFrame) -> List[int]:
+    """Every movieId in the train split, ranked by rating COUNT (descending;
+    ties broken by ascending movieId for determinism).
+
+    Count, not average rating, on purpose: ranking by mean rating needs a
+    minimum-support threshold (one lone 5.0 rating would top the list) and,
+    once damped, measures "highest quality" rather than what this baseline is
+    for — the control question "how well does a completely non-personalised
+    most-popular list do?". Interaction count is the standard control and uses
+    only train data, exactly like the models.
+    """
+    counts = train_df.groupby("movieId").size()
+    return sorted((int(m) for m in counts.index),
+                  key=lambda m: (-int(counts[m]), m))
+
+
+def _popularity_recommend(ranking: List[int], seen: set, n: int) -> List[int]:
+    """Top-n most-rated movies the user hasn't rated in train."""
+    recs: List[int] = []
+    for mid in ranking:
+        if mid not in seen:
+            recs.append(mid)
+            if len(recs) == n:
+                break
+    return recs
+
+
+def _popularity_per_user(
+    ranking: List[int],
+    seen_by_user: Dict[int, set],
+    users: List[int],
+    relevant_by_user: Dict[int, Dict[int, float]],
+) -> Dict[int, Tuple[float, float, float]]:
+    """Per-user (precision, recall, ndcg) for the popularity baseline, keyed
+    like _sweep_per_user's inner dicts so it can anchor any user subset."""
+    per_user: Dict[int, Tuple[float, float, float]] = {}
+    for uid in users:
+        rel_ratings = relevant_by_user[uid]
+        rel_ids = set(rel_ratings)
+        rec_ids = _popularity_recommend(ranking, seen_by_user.get(uid, set()), K)
+        per_user[uid] = (
+            precision_at_k(rec_ids, rel_ids, K),
+            recall_at_k(rec_ids, rel_ids, K),
+            ndcg_at_k(rec_ids, rel_ratings, K),
+        )
+    return per_user
 
 
 def _sweep_per_user(
@@ -92,6 +154,7 @@ def _print_sweep(
     per_alpha: Dict[float, Dict[int, Tuple[float, float, float]]],
     user_subset: List[int],
     title: str,
+    baseline: Optional[Dict[int, Tuple[float, float, float]]] = None,
 ) -> None:
     print(f"\n{title}")
     header = f"{'alpha':>6} {'Precision@' + str(K):>13} {'Recall@' + str(K):>11} {'NDCG@' + str(K):>9}"
@@ -104,6 +167,14 @@ def _print_sweep(
         r = sum(m[1] for m in metrics) / n_sub
         g = sum(m[2] for m in metrics) / n_sub
         print(f"{alpha:>6.2f} {p:>13.4f} {r:>11.4f} {g:>9.4f}")
+    if baseline is not None:
+        # Constant reference row: the non-personalised control every alpha
+        # setting should be compared against.
+        metrics = [baseline[uid] for uid in user_subset]
+        p = sum(m[0] for m in metrics) / n_sub
+        r = sum(m[1] for m in metrics) / n_sub
+        g = sum(m[2] for m in metrics) / n_sub
+        print(f"{'pop':>6} {p:>13.4f} {r:>11.4f} {g:>9.4f}   <- popularity baseline")
 
 
 def main() -> None:
@@ -154,10 +225,21 @@ def main() -> None:
     print(f"  {len(eligible)} eligible users; evaluating {len(sampled)} "
           f"(>= {MIN_TEST_RELEVANT} relevant test movies each)\n")
 
-    models = ["SVD-only", "Content-only", f"Hybrid (α={ALPHA})"]
+    # Popularity control: one global most-rated ranking (train counts only),
+    # personalised only by excluding each user's train-rated movies.
+    pop_ranking = _popularity_ranking(train_df)
+    seen_by_user: Dict[int, set] = {
+        int(uid): set(int(m) for m in grp)
+        for uid, grp in train_df.groupby("userId")["movieId"]
+    }
+
+    models = ["Popularity", "SVD-only", "Content-only", f"Hybrid (α={ALPHA})"]
     sums: Dict[str, Dict[str, float]] = {
         m: {"precision": 0.0, "recall": 0.0, "ndcg": 0.0} for m in models
     }
+    # Each user's top-10 per model, kept for the long-tail stratified table
+    # (same lists, re-scored against a restricted relevant set).
+    recs_by_user: Dict[int, Dict[str, List[int]]] = {}
 
     for uid in sampled:
         rel_ratings = relevant_by_user[uid]
@@ -167,12 +249,15 @@ def main() -> None:
                       train_df.loc[train_df["userId"] == uid, "movieId"]]
 
         recs = {
+            "Popularity": _popularity_recommend(
+                pop_ranking, seen_by_user.get(uid, set()), K),
             "SVD-only": [m for m, _ in svd.recommend(uid, n=K)],
             "Content-only": [m for m, _ in content.recommend(
                 liked_ids, n=K, weights=weights, exclude=seen_train)],
-            models[2]: [m for m, _ in hybrid.recommend(
+            models[3]: [m for m, _ in hybrid.recommend(
                 user_id=uid, n=K, alpha=ALPHA)],
         }
+        recs_by_user[uid] = recs
 
         for name, rec_ids in recs.items():
             sums[name]["precision"] += precision_at_k(rec_ids, rel_ids, K)
@@ -192,11 +277,56 @@ def main() -> None:
     print(f"\nAveraged over {len(sampled)} users · top-{K} lists · "
           f"relevance = test-set rating >= {RELEVANT_THRESHOLD}")
 
+    # --- Long-tail stratified table ------------------------------------------
+    # Same top-10 lists, but only relevant test items OUTSIDE the HEAD_SIZE
+    # most-rated train movies count as hits (recall/NDCG denominators shrink
+    # accordingly). The popularity baseline recommends almost exclusively head
+    # movies, so it scores ~0 here by construction — any real score from the
+    # personalised models is signal the aggregate table cannot see.
+    head = set(pop_ranking[:HEAD_SIZE])
+    lt_relevant: Dict[int, Dict[int, float]] = {
+        uid: {m: r for m, r in relevant_by_user[uid].items() if m not in head}
+        for uid in sampled
+    }
+    lt_users = [uid for uid in sampled if lt_relevant[uid]]
+    # The sweep's best alpha is the interesting long-tail question; its lists
+    # aren't in recs_by_user, so compute them here.
+    lt_models = models + ["Hybrid (α=0.75)"]
+    for uid in lt_users:
+        recs_by_user[uid]["Hybrid (α=0.75)"] = [
+            m for m, _ in hybrid.recommend(user_id=uid, n=K, alpha=0.75)
+        ]
+
+    n_lt_items = [len(lt_relevant[uid]) for uid in lt_users]
+    print(f"\nLong-tail stratum — relevant test items outside the "
+          f"{HEAD_SIZE} most-rated train movies")
+    print(f"({len(lt_users)}/{len(sampled)} sampled users have >= 1 such item; "
+          f"{min(n_lt_items)}-{max(n_lt_items)} each, "
+          f"mean {sum(n_lt_items) / len(lt_users):.1f})")
+    header = (f"{'Model':<16} {'Precision@' + str(K):>13} "
+              f"{'Recall@' + str(K):>11} {'NDCG@' + str(K):>9}")
+    print(header)
+    print("-" * len(header))
+    n_lt = float(len(lt_users))
+    for name in lt_models:
+        p = r = g = 0.0
+        for uid in lt_users:
+            rel_ratings = lt_relevant[uid]
+            rel_ids = set(rel_ratings)
+            rec_ids = recs_by_user[uid][name]
+            p += precision_at_k(rec_ids, rel_ids, K)
+            r += recall_at_k(rec_ids, rel_ids, K)
+            g += ndcg_at_k(rec_ids, rel_ratings, K)
+        print(f"{name:<16} {p / n_lt:>13.4f} {r / n_lt:>11.4f} {g / n_lt:>9.4f}")
+
     # --- Alpha sweep: is there a sweet spot above pure content? --------------
     per_alpha = _sweep_per_user(hybrid, sampled, relevant_by_user)
+    pop_metrics = _popularity_per_user(
+        pop_ranking, seen_by_user, sampled, relevant_by_user)
     _print_sweep(per_alpha, sampled,
                  f"Alpha sweep — all {len(sampled)} sampled users "
-                 f"(1.0 = pure SVD, 0.0 = pure content):")
+                 f"(1.0 = pure SVD, 0.0 = pure content):",
+                 baseline=pop_metrics)
 
     # Sparse-history slice WITHIN the main sample (kept for continuity; the
     # dedicated protocol below is the statistically meaningful version).
@@ -208,7 +338,8 @@ def main() -> None:
         _print_sweep(per_alpha, sparse_in_sample,
                      f"Alpha sweep — {len(sparse_in_sample)} sparse-history users "
                      f"within the main sample (< {SPARSE_THRESHOLD} train ratings; "
-                     f"range {min(counts)}-{max(counts)}):")
+                     f"range {min(counts)}-{max(counts)}):",
+                     baseline=pop_metrics)
 
     # =========================================================================
     # Dedicated sparse-user protocol — separate sampling pass.
@@ -253,8 +384,11 @@ def main() -> None:
         print(f"⚠ Small sample (n={len(sparse_pop)} < 30) — treat as directional only.")
 
     sparse_per_alpha = _sweep_per_user(hybrid, sparse_pop, relevant_by_user)
+    sparse_pop_metrics = _popularity_per_user(
+        pop_ranking, seen_by_user, sparse_pop, relevant_by_user)
     _print_sweep(sparse_per_alpha, sparse_pop,
-                 f"Alpha sweep — sparse users only (n={len(sparse_pop)}):")
+                 f"Alpha sweep — sparse users only (n={len(sparse_pop)}):",
+                 baseline=sparse_pop_metrics)
 
 
 if __name__ == "__main__":

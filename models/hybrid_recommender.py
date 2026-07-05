@@ -5,8 +5,10 @@ content-based filtering (ContentRecommender).
 Why blend:
   * SVD captures latent taste patterns from *who rated what* — strong for users
     with history, but useless for a user (or visitor) the model never saw.
-  * Content filtering scores movies from genre similarity to what someone liked —
-    weaker at capturing subtle taste, but works from a single liked movie.
+  * Content filtering scores movies by item-feature similarity to what someone
+    liked — a weighted blend of genre overlap and plot-embedding similarity
+    (see ContentRecommender) — weaker at capturing subtle taste, but works
+    from a single liked movie.
 
 The blend gives us the best of both while degrading gracefully: warm users get a
 weighted mix; cold-start users and brand-new visitors fall back to content-only.
@@ -96,6 +98,13 @@ class HybridRecommender:
             if idx is not None:
                 aligned[j] = full[idx]
         return aligned
+
+    def has_liked_history(self, user_id: int) -> bool:
+        """True if the user has liked movies (the >=4.0-falling-back-to->=3.5
+        rule) to drive the content half of the blend. False means the content
+        scores are all-zero, so warm-blend output is pure SVD at ANY alpha —
+        callers showing blend percentages should say so instead."""
+        return bool(self._user_liked_movies(user_id)[0])
 
     def predicted_rating(self, user_id: int, movie_id: int) -> Optional[float]:
         """SVD's raw predicted rating (~0.5-5 scale) for a warm user, or None if
