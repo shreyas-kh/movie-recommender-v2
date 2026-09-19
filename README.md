@@ -39,8 +39,11 @@ artifact (`sentence-transformers` is deliberately **not** in `requirements.txt`)
   predicted ratings.
 - **ARPACK instead of randomized SVD.** The randomized solver's final `U = Q @ Uhat` DGEMM
   triggered spurious BLAS `RuntimeWarning`s on macOS even with numerically clean inputs;
-  switching `TruncatedSVD(algorithm="arpack")` eliminated the noise at equal quality. Found
-  by running the test suite with warnings promoted to errors.
+  switching `TruncatedSVD(algorithm="arpack")` eliminated the noise at equal quality. That
+  original finding came from manual investigation during development, not an automated test
+  — no committed test reproduces the randomized-vs-arpack BLAS warning specifically. The
+  `tests/` suite that exists today (see **Testing** below) does pass cleanly with
+  `RuntimeWarning` promoted to an error.
 - **Genre + plot-embedding blend, not replacement.** The two content signals fail in
   complementary ways: genres can't rank within a category (hundreds of Animation|Children
   movies tie at cosine 1.0), embeddings can't see tone ("toys come to life" matches both
@@ -94,6 +97,32 @@ discovery in the long tail, and fully resolving "how much value" would take onli
 Reproduce all tables with `python models/run_evaluation.py` (temporal split; add
 `--split random` to see the flattering leaky numbers for comparison).
 
+## Testing
+
+`tests/` (pytest; `pip install -r requirements-dev.txt`) covers the regressions found during
+development, against small synthetic fixtures rather than the full dataset — no test loads
+MovieLens data:
+
+- **Metrics** (`test_evaluate.py`) — precision/recall/NDCG against hand-derived values,
+  including the NDCG rank-2 `log2(3)` discount case specifically.
+- **Temporal split invariants** (`test_split.py`) — zero ordering violations across all
+  users, every user retains ≥1 train row, plus the single-rating edge case.
+- **Hybrid blend NaN regression** (`test_hybrid_recommender.py`) — reproduces the old
+  `0.0 * -inf` bug directly (and asserts it warns), then confirms the real pipeline's
+  normalize-then-mask order never silently drops a legitimate unseen candidate at either
+  alpha extreme.
+- **Content missing-embedding imputation** (`test_content_recommender.py`) — confirms a
+  movie without an embedding scores at the neutral midpoint between the zeroed-term and
+  full-genre-weight extremes, not either one.
+- **Bootstrap significance sanity checks** (`test_significance.py`) — synthetic
+  all-positive, all-zero, and noisy-null cases for `paired_bootstrap_ci`, independent of
+  whether any particular offline evaluation number is itself credible.
+
+30 tests, run with `pytest` from the project root; all pass with `RuntimeWarning` promoted to
+an error (`pytest -W error::RuntimeWarning`). There is no automated test of the Streamlit app
+itself yet (no `AppTest` coverage) — the app's edge-case messaging is currently verified by
+manual testing and the visible caption text only.
+
 ## Features
 
 - **Two modes.** *Existing User*: pick any of the 610 MovieLens users (or a persona), see
@@ -143,6 +172,8 @@ models/
   train.py                # RMSE eval + final fit -> svd_model.pkl
 scripts/                  # one-time TMDB fetches + offline embedding
 data/                     # MovieLens raw + poster/overview/embedding artifacts
+tests/                    # pytest: metrics, split invariants, hybrid NaN regression,
+                          #   content imputation, bootstrap significance sanity checks
 notebooks/01_eda.ipynb    # exploratory data analysis
 ```
 
@@ -155,7 +186,5 @@ notebooks/01_eda.ipynb    # exploratory data analysis
   size would fall inside the noise band, so evaluation power comes first.
 - **Beta sweep** for the genre/embedding weight (β=0.5 was validated qualitatively, not swept
   offline like α was).
-- **Committed test suite** for the regressions found during development (NaN blend guard,
-  temporal-split invariants, embedding imputation).
 - **Online evaluation** — the only way to truly answer the popularity-vs-personalization
   question the offline analysis surfaced.
