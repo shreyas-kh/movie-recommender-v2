@@ -83,7 +83,8 @@ round's conclusion, and the corrections are all preserved in the code and the ap
    **20% of users received at least one long-tail recommendation they went on to rate ≥4.0 —
    a recommendation a popularity system cannot produce.** SVD's lists overlap the popularity
    top-10 by only 2.2/10 movies; they were personalized all along, just invisible to
-   aggregate hit-rate.
+   aggregate hit-rate. (CIs from a paired bootstrap over the same 100 users, 10,000 resamples,
+   seed=42 — `models/significance.py`, printed by `models/run_evaluation.py`.)
 
 The honest conclusion, as shipped in the app's "How it works" panel: on aggregate offline
 metrics, personalization is indistinguishable from popularity; its measurable value is
