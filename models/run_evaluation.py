@@ -26,6 +26,11 @@ Protocol
   famous ones), so a most-popular list scores well without personalising; in
   the long-tail stratum that shortcut is unavailable by construction, making
   any hits there unambiguous personalisation signal.
+* Immediately after that table, a paired bootstrap (models/significance.py,
+  N_BOOTSTRAP resamples, fixed seed) reports the mean SVD-minus-Popularity
+  difference and its 95% CI for each metric, over the same lt_users — this is
+  what actually justifies calling the long-tail gap "statistically
+  significant" rather than just a bigger point estimate.
 
 Run from the project root:
     python models/run_evaluation.py                  # temporal split (default)
@@ -44,6 +49,7 @@ from models.content_recommender import ContentRecommender
 from models.evaluate import ndcg_at_k, precision_at_k, recall_at_k
 from models.hybrid_recommender import HybridRecommender
 from models.recommender import SVDRecommender
+from models.significance import paired_bootstrap_ci
 from models.split import split_ratings
 
 DATA_DIR = Path(__file__).parent.parent / "data" / "raw"
@@ -63,6 +69,8 @@ SPARSE_MIN_TEST_RELEVANT = 2
 # "Head" = this many most-rated train movies. Relevant test items outside the
 # head form the long-tail stratum for the stratified table.
 HEAD_SIZE = 100
+N_BOOTSTRAP = 10000     # paired-bootstrap resamples for the significance test
+BOOTSTRAP_SEED = 42
 
 
 def _liked_from_train(train_df: pd.DataFrame, user_id: int) -> Tuple[List[int], List[float]]:
@@ -318,6 +326,39 @@ def main() -> None:
             r += recall_at_k(rec_ids, rel_ids, K)
             g += ndcg_at_k(rec_ids, rel_ratings, K)
         print(f"{name:<16} {p / n_lt:>13.4f} {r / n_lt:>11.4f} {g / n_lt:>9.4f}")
+
+    # --- Long-tail significance: paired bootstrap, SVD-only vs Popularity ---
+    # Point estimates above can't say whether SVD's long-tail edge over the
+    # (by-construction ~0) popularity baseline is real or noise. Bootstrap the
+    # paired per-user difference (same lt_users for both models) N_BOOTSTRAP
+    # times and report the mean + 95% CI for each metric; a CI excluding zero
+    # is the actual evidence behind "statistically significant" in the docs.
+    p_diffs, r_diffs, g_diffs = [], [], []
+    for uid in lt_users:
+        rel_ratings = lt_relevant[uid]
+        rel_ids = set(rel_ratings)
+        svd_ids = recs_by_user[uid]["SVD-only"]
+        pop_ids = recs_by_user[uid]["Popularity"]
+        p_diffs.append(precision_at_k(svd_ids, rel_ids, K) - precision_at_k(pop_ids, rel_ids, K))
+        r_diffs.append(recall_at_k(svd_ids, rel_ids, K) - recall_at_k(pop_ids, rel_ids, K))
+        g_diffs.append(ndcg_at_k(svd_ids, rel_ratings, K) - ndcg_at_k(pop_ids, rel_ratings, K))
+
+    p_mean, p_lo, p_hi = paired_bootstrap_ci(p_diffs, n_resamples=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
+    r_mean, r_lo, r_hi = paired_bootstrap_ci(r_diffs, n_resamples=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
+    g_mean, g_lo, g_hi = paired_bootstrap_ci(g_diffs, n_resamples=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
+
+    print(f"\nLong-tail significance — paired bootstrap, SVD-only minus Popularity "
+          f"(n={len(lt_users)} users, {N_BOOTSTRAP:,} resamples, seed={BOOTSTRAP_SEED}):")
+    sig_header = f"{'Metric':<12} {'Mean diff':>10} {'95% CI':>22} {'Significant?':>13}"
+    print(sig_header)
+    print("-" * len(sig_header))
+    for label, mean, lo, hi in (
+        ("Precision@" + str(K), p_mean, p_lo, p_hi),
+        ("Recall@" + str(K), r_mean, r_lo, r_hi),
+        ("NDCG@" + str(K), g_mean, g_lo, g_hi),
+    ):
+        sig = "yes" if lo > 0 or hi < 0 else "no"
+        print(f"{label:<12} {mean:>+10.4f} {'[' + f'{lo:+.4f}, {hi:+.4f}' + ']':>22} {sig:>13}")
 
     # --- Alpha sweep: is there a sweet spot above pure content? --------------
     per_alpha = _sweep_per_user(hybrid, sampled, relevant_by_user)
